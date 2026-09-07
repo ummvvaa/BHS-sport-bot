@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar
@@ -30,13 +30,17 @@ T = TypeVar("T")
 
 TZ = ZoneInfo("Asia/Almaty")
 CLASSES: tuple[int, ...] = (8, 9, 10, 11)
+GROUPS: tuple[str, ...] = ("8-9", "10-11")
+CLASS_GROUP: dict[int, str] = {8: "8-9", 9: "8-9", 10: "10-11", 11: "10-11"}
 DATE_FORMAT = "%d.%m.%Y %H:%M"
 CACHE_TTL_SECONDS = 60
 
 SETTINGS_SHEET = "Настройки"
 LIMITS_SHEET = "Лимиты"
 STUDENTS_SHEET = "Ученики"
-STUDENTS_HEADERS: list[str] = ["tg_id", "Имя", "Класс", "Телефон", "Язык", "Секция", "Дата записи"]
+STUDENTS_HEADERS: list[str] = [
+    "tg_id", "Имя", "Класс", "Телефон", "Язык", "Секция", "Дата записи", "Дата регистрации",
+]
 SECTION_HEADERS: list[str] = ["Имя", "Класс", "Телефон", "tg_id", "Дата записи"]
 
 SCOPES = [
@@ -64,11 +68,28 @@ class EnrollStatus(str, Enum):
     UNKNOWN_SECTION = "unknown_section"
 
 
+def group_of(class_num: int) -> str | None:
+    """8, 9 → «8-9»; 10, 11 → «10-11»; иначе None."""
+    return CLASS_GROUP.get(class_num)
+
+
 @dataclass(frozen=True)
 class SectionLimit:
     name: str
-    total: int
-    per_class: dict[int, int]
+    per_group: dict[str, int | None]  # None или 0 — группа не допускается к секции
+
+    def group_limit(self, group: str | None) -> int:
+        if group is None:
+            return 0
+        return self.per_group.get(group) or 0
+
+    @property
+    def total(self) -> int:
+        return sum(self.group_limit(group) for group in GROUPS)
+
+    @property
+    def is_active(self) -> bool:
+        return self.total > 0
 
 
 @dataclass(frozen=True)
@@ -80,6 +101,7 @@ class Student:
     lang: str
     section: str | None
     enrolled_at: str | None
+    registered_at: str | None
     row: int  # номер строки в листе «Ученики» (1-based)
 
 
@@ -96,7 +118,7 @@ class Enrollment:
 @dataclass(frozen=True)
 class Availability:
     name: str
-    free_for_class: int
+    free_for_group: int
     free_total: int
     available: bool
 
@@ -111,7 +133,7 @@ class EnrollResult:
 class SectionStats:
     limit: SectionLimit
     count_total: int
-    count_by_class: dict[int, int]
+    count_by_group: dict[str, int]
 
     @property
     def name(self) -> str:
@@ -131,6 +153,40 @@ class Stats:
 class ExportData:
     sections: list[tuple[SectionLimit, list[Enrollment]]]
     stats: Stats
+
+
+@dataclass(frozen=True)
+class ClassAnalytics:
+    registered: int
+    enrolled: int
+
+    @property
+    def without_section(self) -> int:
+        return self.registered - self.enrolled
+
+
+@dataclass(frozen=True)
+class Analytics:
+    days: int | None
+    per_class: dict[int, ClassAnalytics]
+    by_day: list[tuple[str, dict[int, int]]]  # («06.09», {8: 5, 9: 1, ...}) — регистрации по дням
+    by_day_truncated: bool
+
+    @property
+    def registered(self) -> int:
+        return sum(item.registered for item in self.per_class.values())
+
+    @property
+    def enrolled(self) -> int:
+        return sum(item.enrolled for item in self.per_class.values())
+
+    @property
+    def most_passive(self) -> tuple[int, int] | None:
+        """(класс, зарегистрировано) с минимальным числом регистраций."""
+        if not self.per_class:
+            return None
+        class_num = min(CLASSES, key=lambda c: (self.per_class[c].registered, c))
+        return class_num, self.per_class[class_num].registered
 
 
 # --------------------------------------------------------------------------- #
@@ -165,23 +221,42 @@ def _invalidate(*keys: str) -> None:
 
 
 def _to_int(value: Any, default: int = 0) -> int:
+    parsed = _to_int_or_none(value)
+    return default if parsed is None else parsed
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    """Терпимый парсинг: пробелы обрезаются, пустая строка и мусор → None."""
     if value is None:
-        return default
-    text = str(value).strip()
+        return None
+    text = str(value).strip().replace(" ", "").replace(" ", "")
     if not text:
-        return default
+        return None
     try:
         return int(float(text.replace(",", ".")))
     except ValueError:
-        return default
+        return None
 
 
 def _cell(row: list[str], index: int) -> str:
     return row[index].strip() if index < len(row) and row[index] is not None else ""
 
 
+def _now() -> datetime:
+    return datetime.now(TZ)
+
+
 def _now_str() -> str:
-    return datetime.now(TZ).strftime(DATE_FORMAT)
+    return _now().strftime(DATE_FORMAT)
+
+
+def _parse_date(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw.strip(), DATE_FORMAT).replace(tzinfo=TZ)
+    except ValueError:
+        return None
 
 
 def _quote_sheet(title: str) -> str:
@@ -278,14 +353,15 @@ def _get_deadline() -> datetime | None:
 
 def _is_closed() -> bool:
     deadline = _get_deadline()
-    return deadline is not None and datetime.now(TZ) >= deadline
+    return deadline is not None and _now() >= deadline
 
 
 def _load_limits() -> list[SectionLimit]:
+    """Читает лист «Лимиты»: Секция | 8-9 | 10-11. Секции без лимитов в обеих группах отбрасываются."""
     rows = _ws(LIMITS_SHEET).get_all_values()
     if not rows:
         return []
-    header = [h.strip().lower() for h in rows[0]]
+    header = [h.strip().lower().replace(" ", "") for h in rows[0]]
 
     def col(name: str) -> int:
         try:
@@ -293,12 +369,11 @@ def _load_limits() -> list[SectionLimit]:
         except ValueError as exc:
             raise SheetsError(
                 f"В листе «{LIMITS_SHEET}» нет колонки «{name}». "
-                f"Ожидаются: Секция | Общий лимит | {' | '.join(str(c) for c in CLASSES)}"
+                f"Ожидаются: Секция | {' | '.join(GROUPS)}"
             ) from exc
 
     name_col = col("Секция")
-    total_col = col("Общий лимит")
-    class_cols = {c: col(str(c)) for c in CLASSES}
+    group_cols = {group: col(group) for group in GROUPS}
 
     limits: list[SectionLimit] = []
     seen: set[str] = set()
@@ -307,13 +382,14 @@ def _load_limits() -> list[SectionLimit]:
         if not name or name in seen:
             continue
         seen.add(name)
-        limits.append(
-            SectionLimit(
-                name=name,
-                total=_to_int(_cell(row, total_col)),
-                per_class={c: _to_int(_cell(row, class_cols[c])) for c in CLASSES},
-            )
+        limit = SectionLimit(
+            name=name,
+            per_group={group: _to_int_or_none(_cell(row, group_cols[group])) for group in GROUPS},
         )
+        if not limit.is_active:
+            logger.info("Секция «%s» без лимитов в обеих группах — пропускается", name)
+            continue
+        limits.append(limit)
     return limits
 
 
@@ -330,8 +406,6 @@ def _parse_student(row: list[str], row_number: int) -> Student | None:
     tg_raw = _cell(row, 0)
     if not tg_raw.lstrip("-").isdigit():
         return None
-    section = _cell(row, 5)
-    enrolled_at = _cell(row, 6)
     lang = _cell(row, 4).lower() or "ru"
     return Student(
         tg_id=int(tg_raw),
@@ -339,8 +413,9 @@ def _parse_student(row: list[str], row_number: int) -> Student | None:
         class_num=_to_int(_cell(row, 2)),
         phone=_cell(row, 3),
         lang=lang if lang in ("ru", "kk") else "ru",
-        section=section or None,
-        enrolled_at=enrolled_at or None,
+        section=_cell(row, 5) or None,
+        enrolled_at=_cell(row, 6) or None,
+        registered_at=_cell(row, 7) or None,
         row=row_number,
     )
 
@@ -367,7 +442,7 @@ def _upsert_student_sync(tg_id: int, name: str, class_num: int, phone: str, lang
     existing = _find_student(tg_id)
     if existing is None:
         ws.append_row(
-            [str(tg_id), name, str(class_num), phone, lang, "", ""],
+            [str(tg_id), name, str(class_num), phone, lang, "", "", _now_str()],
             value_input_option=ValueInputOption.raw,
         )
         student = _find_student(tg_id)
@@ -375,6 +450,7 @@ def _upsert_student_sync(tg_id: int, name: str, class_num: int, phone: str, lang
             raise SheetsError("Не удалось прочитать только что добавленную строку ученика.")
         return student
 
+    # При перерегистрации обновляются только A:E; секция, даты записи и регистрации сохраняются.
     ws.update(
         range_name=f"A{existing.row}:E{existing.row}",
         values=[[str(tg_id), name, str(class_num), phone, lang]],
@@ -388,6 +464,7 @@ def _upsert_student_sync(tg_id: int, name: str, class_num: int, phone: str, lang
         lang=lang,
         section=existing.section,
         enrolled_at=existing.enrolled_at,
+        registered_at=existing.registered_at,
         row=existing.row,
     )
 
@@ -455,33 +532,40 @@ def _single_section_enrollments(section: str) -> list[Enrollment]:
     return enrollments
 
 
-def _count(enrollments: list[Enrollment]) -> tuple[int, dict[int, int]]:
-    by_class: dict[int, int] = {c: 0 for c in CLASSES}
+def _count(enrollments: list[Enrollment]) -> tuple[int, dict[str, int]]:
+    by_group: dict[str, int] = {group: 0 for group in GROUPS}
     for item in enrollments:
-        if item.class_num in by_class:
-            by_class[item.class_num] += 1
-    return len(enrollments), by_class
+        group = group_of(item.class_num)
+        if group is not None:
+            by_group[group] += 1
+    return len(enrollments), by_group
 
 
-def _has_place(limit: SectionLimit, enrollments: list[Enrollment], class_num: int) -> bool:
-    total, by_class = _count(enrollments)
-    return total < limit.total and by_class.get(class_num, 0) < limit.per_class.get(class_num, 0)
+def _free_for_group(limit: SectionLimit, enrollments: list[Enrollment], group: str | None) -> int:
+    if group is None:
+        return 0
+    _, by_group = _count(enrollments)
+    return max(limit.group_limit(group) - by_group.get(group, 0), 0)
 
 
 def _availability_sync(class_num: int) -> list[Availability]:
-    limits = _get_limits()
+    """Секции для группы ученика. Секции с пустым/нулевым лимитом группы не попадают в список."""
+    group = group_of(class_num)
+    if group is None:
+        return []
+    limits = [limit for limit in _get_limits() if limit.group_limit(group) > 0]
     enrollments = _section_enrollments(limits)
     result: list[Availability] = []
     for limit in limits:
-        total, by_class = _count(enrollments.get(limit.name, []))
-        free_total = max(limit.total - total, 0)
-        free_for_class = max(limit.per_class.get(class_num, 0) - by_class.get(class_num, 0), 0)
+        items = enrollments.get(limit.name, [])
+        total, _ = _count(items)
+        free_group = _free_for_group(limit, items, group)
         result.append(
             Availability(
                 name=limit.name,
-                free_for_class=min(free_for_class, free_total),
-                free_total=free_total,
-                available=free_total > 0 and free_for_class > 0,
+                free_for_group=free_group,
+                free_total=max(limit.total - total, 0),
+                available=free_group > 0,
             )
         )
     return result
@@ -498,7 +582,9 @@ def _ensure_section_sheets_sync() -> list[str]:
             )
 
     students_ws = existing[STUDENTS_SHEET]
-    if not students_ws.row_values(1):
+    header = [cell.strip() for cell in students_ws.row_values(1)]
+    if not header or len(header) < len(STUDENTS_HEADERS):
+        # Пустой лист или старая схема без «Дата регистрации» — дописываем заголовки.
         students_ws.update(
             range_name="A1",
             values=[STUDENTS_HEADERS],
@@ -536,12 +622,15 @@ def _enroll_sync(tg_id: int, section: str) -> EnrollResult:
     limit = next((item for item in _get_limits() if item.name == section), None)
     if limit is None:
         return EnrollResult(EnrollStatus.UNKNOWN_SECTION)
+    group = group_of(student.class_num)
+    if limit.group_limit(group) <= 0:
+        return EnrollResult(EnrollStatus.FULL, section)
 
-    # Повторная проверка лимитов по свежим данным непосредственно перед записью.
+    # Повторная проверка лимита группы по свежим данным непосредственно перед записью.
     enrollments = _single_section_enrollments(section)
     if any(item.tg_id == tg_id for item in enrollments):
         return EnrollResult(EnrollStatus.ALREADY, section)
-    if not _has_place(limit, enrollments, student.class_num):
+    if _free_for_group(limit, enrollments, group) <= 0:
         return EnrollResult(EnrollStatus.FULL, section)
 
     when = _now_str()
@@ -582,7 +671,7 @@ def _cancel_sync(tg_id: int) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Статистика и экспорт
+# Статистика, экспорт, аналитика
 # --------------------------------------------------------------------------- #
 
 
@@ -595,8 +684,8 @@ def _collect_sync() -> ExportData:
     sections: list[tuple[SectionLimit, list[Enrollment]]] = []
     for limit in limits:
         items = enrollments.get(limit.name, [])
-        total, by_class = _count(items)
-        section_stats.append(SectionStats(limit=limit, count_total=total, count_by_class=by_class))
+        total, by_group = _count(items)
+        section_stats.append(SectionStats(limit=limit, count_total=total, count_by_group=by_group))
         sections.append((limit, items))
 
     stats = Stats(
@@ -607,6 +696,52 @@ def _collect_sync() -> ExportData:
         closed=_is_closed(),
     )
     return ExportData(sections=sections, stats=stats)
+
+
+BY_DAY_LIMIT = 30
+
+
+def _analytics_sync(days: int | None) -> Analytics:
+    """Статистика по каждому классу за всё время или за последние `days` дней (по дате регистрации)."""
+    students = [s for s in _all_students() if s.class_num in CLASSES]
+    cutoff = _now() - timedelta(days=days) if days else None
+
+    if cutoff is not None:
+        # Строки без даты регистрации считаются «давними» и в период не попадают.
+        students = [
+            s for s in students
+            if (registered := _parse_date(s.registered_at)) is not None and registered >= cutoff
+        ]
+
+    per_class = {
+        c: ClassAnalytics(
+            registered=sum(1 for s in students if s.class_num == c),
+            enrolled=sum(1 for s in students if s.class_num == c and s.section),
+        )
+        for c in CLASSES
+    }
+
+    by_day_map: dict[datetime, dict[int, int]] = {}
+    for student in students:
+        registered = _parse_date(student.registered_at)
+        if registered is None:
+            continue
+        day = registered.replace(hour=0, minute=0, second=0, microsecond=0)
+        by_day_map.setdefault(day, {c: 0 for c in CLASSES})[student.class_num] += 1
+    days_sorted = sorted(by_day_map)
+    truncated = cutoff is None and len(days_sorted) > BY_DAY_LIMIT
+    if truncated:
+        days_sorted = days_sorted[-BY_DAY_LIMIT:]
+    by_day = [(day.strftime("%d.%m"), by_day_map[day]) for day in days_sorted]
+
+    return Analytics(days=days, per_class=per_class, by_day=by_day, by_day_truncated=truncated)
+
+
+def _students_without_section_sync(class_num: int | None) -> list[Student]:
+    return [
+        s for s in _all_students()
+        if not s.section and (class_num is None or s.class_num == class_num)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -666,6 +801,14 @@ async def get_stats() -> Stats:
 
 async def get_export_data() -> ExportData:
     return await _run(_collect_sync)
+
+
+async def get_analytics(days: int | None = None) -> Analytics:
+    return await _run(_analytics_sync, days)
+
+
+async def get_students_without_section(class_num: int | None = None) -> list[Student]:
+    return await _run(_students_without_section_sync, class_num)
 
 
 def reload_cache() -> None:

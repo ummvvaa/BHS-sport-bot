@@ -8,7 +8,8 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, ErrorEvent, Message
 
 import sheets
 from config import settings
@@ -52,14 +53,27 @@ async def on_error(event: ErrorEvent, state: FSMContext | None = None) -> bool:
 
 
 async def set_commands(bot: Bot) -> None:
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description=t("ru", "cmd_start")),
-            BotCommand(command="my", description=t("ru", "cmd_my")),
-            BotCommand(command="lang", description=t("ru", "cmd_lang")),
-            BotCommand(command="cancel", description=t("ru", "cmd_cancel")),
-        ]
-    )
+    """Меню команд: ученикам — базовые, админам (по chat_id) — плюс админские."""
+    user_commands = [
+        BotCommand(command="start", description=t("ru", "cmd_start")),
+        BotCommand(command="my", description=t("ru", "cmd_my")),
+        BotCommand(command="lang", description=t("ru", "cmd_lang")),
+        BotCommand(command="cancel", description=t("ru", "cmd_cancel")),
+    ]
+    admin_commands = user_commands + [
+        BotCommand(command="stats", description=t("ru", "cmd_stats")),
+        BotCommand(command="analytics", description=t("ru", "cmd_analytics")),
+        BotCommand(command="remind", description=t("ru", "cmd_remind")),
+        BotCommand(command="export", description=t("ru", "cmd_export")),
+        BotCommand(command="reload", description=t("ru", "cmd_reload")),
+    ]
+    await bot.set_my_commands(user_commands)
+    for admin_id in sorted(settings.admin_ids):
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except TelegramBadRequest as exc:
+            # Обычно «chat not found»: админ ещё ни разу не писал боту.
+            logger.warning("Не удалось задать меню команд для админа %s: %s", admin_id, exc)
 
 
 async def main() -> None:

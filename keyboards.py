@@ -29,6 +29,8 @@ CB_ENROLL_BACK = "enroll:back"    # «↩️ Другая секция»
 CB_CANCEL_ASK = "cancel:ask"
 CB_CANCEL_YES = "cancel:yes"
 CB_CANCEL_NO = "cancel:no"
+CB_REMIND_YES = "remind:yes"     # remind:yes:<класс|all>
+CB_REMIND_NO = "remind:no"
 
 CLASS_BUTTONS: tuple[str, ...] = tuple(str(c) for c in CLASSES)
 # Тексты reply-кнопки «← Назад» на всех языках — по ним фильтруются хендлеры шагов.
@@ -97,7 +99,7 @@ def sections_kb(lang: str, availability: Sequence[Availability]) -> InlineKeyboa
     rows: list[list[InlineKeyboardButton]] = []
     for index, item in enumerate(availability):
         if item.available:
-            text = f"✅ {item.name} — {places(lang, item.free_for_class)}"
+            text = f"✅ {item.name} — {places(lang, item.free_for_group)}"
             data = f"{CB_SECTION}:{index}"
         else:
             text = f"🚫 {item.name} — {t(lang, 'no_places')}"
@@ -133,6 +135,18 @@ def cancel_confirm_kb(lang: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text=t(lang, "btn_yes"), callback_data=CB_CANCEL_YES),
                 InlineKeyboardButton(text=t(lang, "btn_no"), callback_data=CB_CANCEL_NO),
+            ]
+        ]
+    )
+
+
+def remind_confirm_kb(target: str) -> InlineKeyboardMarkup:
+    """Подтверждение рассылки: target — номер класса или «all»."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=t("ru", "btn_yes"), callback_data=f"{CB_REMIND_YES}:{target}"),
+                InlineKeyboardButton(text=t("ru", "btn_no"), callback_data=CB_REMIND_NO),
             ]
         ]
     )

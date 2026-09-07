@@ -86,10 +86,31 @@ TEXTS: dict[str, dict[str, str]] = {
         "cancelled": "Запись отменена. Можешь выбрать новую секцию.",
         "cancel_kept": "Запись сохранена.",
         "nothing_to_cancel": "У тебя нет активной записи.",
+        # Напоминание от админа
+        "remind": "Ты ещё не выбрал секцию. Свободные места пока есть — жми /start",
         # Админ
         "admin_no_sections": "В листе «Лимиты» нет ни одной секции.",
-        "stats_line": "{section}: {count}/{limit} ({by_class})",
-        "stats_class": "{class_num}кл {count}/{limit}",
+        "stats_line": "{section}: {count}/{limit} ({by_group})",
+        "stats_group": "{group}кл {count}/{limit}",
+        "analytics_title_all": "📊 Аналитика за всё время",
+        "analytics_title_days": "📊 Аналитика за последние {period}",
+        "analytics_passive": "Самый пассивный: {class_num} класс ({count} чел.)",
+        "analytics_total": "Всего: {registered} зарегались, {enrolled} записались",
+        "analytics_by_day": "📈 По дням:",
+        "analytics_by_day_empty": "📈 По дням: нет данных (у строк нет даты регистрации)",
+        "analytics_by_day_truncated": "(показаны последние {n} дней)",
+        "analytics_usage": (
+            "Использование: /analytics — за всё время, /analytics N — за последние N дней (1–365)."
+        ),
+        "remind_usage": "Использование: /remind 9 (класс 8–11) или /remind all",
+        "remind_closed": "Запись закрыта — напоминание отправлять нет смысла.",
+        "remind_nobody": "Некому отправлять: у всех учеников ({target}) уже есть секция.",
+        "remind_confirm": "Отправить напоминание {n} ученикам ({target})?",
+        "remind_sending": "Отправляю {n} ученикам…",
+        "remind_report": "Отправлено: {sent}, не доставлено: {failed}",
+        "remind_cancelled": "Рассылка отменена.",
+        "remind_target_class": "{class_num} класс",
+        "remind_target_all": "все классы",
         "stats_total": "Всего зарегистрировано: {registered}, записано: {enrolled}",
         "stats_deadline": "Дедлайн: {deadline} (Asia/Almaty)",
         "stats_no_deadline": "Дедлайн: не задан",
@@ -102,6 +123,11 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmd_my": "Моя запись / Менің жазылуым",
         "cmd_lang": "Сменить язык / Тілді өзгерту",
         "cmd_cancel": "Начать заново / Қайта бастау",
+        "cmd_stats": "Сводка по секциям (админ)",
+        "cmd_export": "Выгрузка в .xlsx (админ)",
+        "cmd_analytics": "Аналитика по классам (админ)",
+        "cmd_remind": "Напомнить ученикам без секции (админ)",
+        "cmd_reload": "Сбросить кэш лимитов (админ)",
     },
     "kk": {
         # Общие
@@ -174,6 +200,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "Сен {section} секциясына жазылғансың. "
             "Секцияны ауыстыру үшін алдымен жазылуды болдырма — /my"
         ),
+        # Напоминание от админа
+        "remind": "Сен әлі секция таңдаған жоқсың. Бос орындар әзірге бар — /start бас",
         # /my
         "my_enrolled": "Сенің жазылуың: {section}, {class_num}-сынып",
         "not_enrolled": "Сен әлі ешбір секцияға жазылмағансың.",
@@ -212,6 +240,11 @@ def _plural_ru(n: int, one: str, few: str, many: str) -> str:
     if 2 <= n_abs % 10 <= 4 and not 12 <= n_abs % 100 <= 14:
         return few
     return many
+
+
+def days_ru(n: int) -> str:
+    """«1 день» / «2 дня» / «7 дней»."""
+    return f"{n} {_plural_ru(n, 'день', 'дня', 'дней')}"
 
 
 def places(lang: str, n: int) -> str:
