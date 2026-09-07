@@ -205,13 +205,17 @@ async def _run(fn: Callable[..., T], *args: Any) -> T:
 
 @functools.lru_cache(maxsize=1)
 def _spreadsheet() -> gspread.Spreadsheet:
-    path = Path(settings.credentials_path)
-    if not path.is_file():
-        raise SheetsError(
-            f"Файл сервисного аккаунта не найден: {path.resolve()}. "
-            "Проверь GOOGLE_CREDENTIALS_PATH в .env."
-        )
-    creds = Credentials.from_service_account_file(str(path), scopes=SCOPES)
+    if settings.credentials_info is not None:
+        # Ключ передан через переменную окружения GOOGLE_CREDENTIALS_JSON (Railway и т.п.).
+        creds = Credentials.from_service_account_info(settings.credentials_info, scopes=SCOPES)
+    else:
+        path = Path(settings.credentials_path)
+        if not path.is_file():
+            raise SheetsError(
+                f"Файл сервисного аккаунта не найден: {path.resolve()}. "
+                "Проверь GOOGLE_CREDENTIALS_PATH в .env или задай GOOGLE_CREDENTIALS_JSON."
+            )
+        creds = Credentials.from_service_account_file(str(path), scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(settings.spreadsheet_id)
 

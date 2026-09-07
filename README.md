@@ -109,7 +109,35 @@ python main.py
 При старте бот проверит наличие листов `Настройки`, `Лимиты`, `Ученики` и создаст недостающие листы секций.
 Логи пишутся в stdout.
 
-## 7. Команды
+## 7. Деплой на Railway
+
+Бот работает через polling, поэтому публичный домен и порт не нужны — достаточно сервиса типа worker.
+
+1. Залей проект в GitHub-репозиторий. Файлы `.env` и `credentials.json` в репозиторий не попадают (они в `.gitignore`), их содержимое передаётся через переменные окружения.
+2. На [railway.app](https://railway.app) нажми «New Project → Deploy from GitHub repo» и выбери репозиторий.
+   Railway найдёт `Procfile` (`worker: python main.py`) и `requirements.txt`, версия Python берётся из `runtime.txt` / `.python-version` (3.12).
+3. Во вкладке «Variables» сервиса добавь переменные:
+
+   | Переменная | Значение |
+   |---|---|
+   | `BOT_TOKEN` | токен от @BotFather |
+   | `SPREADSHEET_ID` | ID таблицы |
+   | `ADMIN_IDS` | tg_id админов через запятую |
+   | `GOOGLE_CREDENTIALS_JSON` | содержимое `credentials.json` одной строкой |
+
+   Однострочный JSON для `GOOGLE_CREDENTIALS_JSON` можно получить так:
+
+   ```bash
+   python -c "import json; print(json.dumps(json.load(open('credentials.json'))))"
+   ```
+
+   Скопируй вывод целиком, включая фигурные скобки. `GOOGLE_CREDENTIALS_PATH` на Railway не нужен: если задана `GOOGLE_CREDENTIALS_JSON`, файл не читается.
+4. Нажми «Deploy». В логах сервиса должно появиться `Бот запущен, админы: [...]`.
+5. Запускай ровно один экземпляр бота: два одновременных polling-процесса с одним токеном конфликтуют (Telegram отвечает ошибкой `Conflict: terminated by other getUpdates request`). Перед деплоем на Railway останови локальный `python main.py`.
+
+`railway.json` задаёт команду запуска и перезапуск при падении (до 10 попыток).
+
+## 8. Команды
 
 ### Для ученика
 
@@ -159,6 +187,10 @@ sport_bot/
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
+├── Procfile           # Railway: worker: python main.py
+├── runtime.txt        # версия Python для Railway (3.12)
+├── .python-version
+├── railway.json       # команда запуска и политика перезапуска
 └── README.md
 ```
 
