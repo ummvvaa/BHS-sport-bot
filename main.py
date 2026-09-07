@@ -84,6 +84,8 @@ async def main() -> None:
         logger.info("Созданы листы секций: %s", ", ".join(created))
     else:
         logger.info("Все листы секций на месте")
+    await sheets.refresh_analytics()
+    logger.info("Лист «%s» обновлён", sheets.ANALYTICS_SHEET)
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())

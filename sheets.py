@@ -38,6 +38,9 @@ CACHE_TTL_SECONDS = 60
 SETTINGS_SHEET = "Настройки"
 LIMITS_SHEET = "Лимиты"
 STUDENTS_SHEET = "Ученики"
+ANALYTICS_SHEET = "Аналитика"
+ANALYTICS_COLS = 6
+ANALYTICS_BY_DAY_DAYS = 14
 STUDENTS_HEADERS: list[str] = [
     "tg_id", "Имя", "Класс", "Телефон", "Язык", "Секция", "Дата записи", "Дата регистрации",
 ]
@@ -591,6 +594,11 @@ def _ensure_section_sheets_sync() -> list[str]:
             value_input_option=ValueInputOption.raw,
         )
 
+    if ANALYTICS_SHEET not in existing:
+        sh.add_worksheet(title=ANALYTICS_SHEET, rows=100, cols=ANALYTICS_COLS)
+        _invalidate("worksheets")
+        logger.info("Создан лист «%s»", ANALYTICS_SHEET)
+
     created: list[str] = []
     for limit in _get_limits():
         if limit.name in existing:
@@ -701,33 +709,55 @@ def _collect_sync() -> ExportData:
 BY_DAY_LIMIT = 30
 
 
-def _analytics_sync(days: int | None) -> Analytics:
-    """Статистика по каждому классу за всё время или за последние `days` дней (по дате регистрации)."""
-    students = [s for s in _all_students() if s.class_num in CLASSES]
-    cutoff = _now() - timedelta(days=days) if days else None
+def _in_window(student: Student, start: datetime | None, end: datetime | None) -> bool:
+    """Попадает ли дата регистрации в [start, end). Без границ — попадают все.
 
-    if cutoff is not None:
-        # Строки без даты регистрации считаются «давними» и в период не попадают.
-        students = [
-            s for s in students
-            if (registered := _parse_date(s.registered_at)) is not None and registered >= cutoff
-        ]
+    Строки без даты регистрации считаются «давними»: попадают только в окно без начала.
+    """
+    if start is None and end is None:
+        return True
+    registered = _parse_date(student.registered_at)
+    if registered is None:
+        return False
+    if start is not None and registered < start:
+        return False
+    if end is not None and registered >= end:
+        return False
+    return True
 
-    per_class = {
+
+def _class_counts(
+    students: list[Student], start: datetime | None, end: datetime | None
+) -> dict[int, ClassAnalytics]:
+    window = [s for s in students if _in_window(s, start, end)]
+    return {
         c: ClassAnalytics(
-            registered=sum(1 for s in students if s.class_num == c),
-            enrolled=sum(1 for s in students if s.class_num == c and s.section),
+            registered=sum(1 for s in window if s.class_num == c),
+            enrolled=sum(1 for s in window if s.class_num == c and s.section),
         )
         for c in CLASSES
     }
 
-    by_day_map: dict[datetime, dict[int, int]] = {}
+
+def _registrations_by_day(students: list[Student]) -> dict[datetime, dict[int, int]]:
+    by_day: dict[datetime, dict[int, int]] = {}
     for student in students:
         registered = _parse_date(student.registered_at)
         if registered is None:
             continue
         day = registered.replace(hour=0, minute=0, second=0, microsecond=0)
-        by_day_map.setdefault(day, {c: 0 for c in CLASSES})[student.class_num] += 1
+        by_day.setdefault(day, {c: 0 for c in CLASSES})[student.class_num] += 1
+    return by_day
+
+
+def _analytics_sync(days: int | None) -> Analytics:
+    """Статистика по каждому классу за всё время или за последние `days` дней (по дате регистрации)."""
+    students = [s for s in _all_students() if s.class_num in CLASSES]
+    cutoff = _now() - timedelta(days=days) if days else None
+    per_class = _class_counts(students, cutoff, None)
+
+    window = [s for s in students if _in_window(s, cutoff, None)]
+    by_day_map = _registrations_by_day(window)
     days_sorted = sorted(by_day_map)
     truncated = cutoff is None and len(days_sorted) > BY_DAY_LIMIT
     if truncated:
@@ -735,6 +765,70 @@ def _analytics_sync(days: int | None) -> Analytics:
     by_day = [(day.strftime("%d.%m"), by_day_map[day]) for day in days_sorted]
 
     return Analytics(days=days, per_class=per_class, by_day=by_day, by_day_truncated=truncated)
+
+
+def _most_passive(per_class: dict[int, ClassAnalytics]) -> tuple[int, int]:
+    class_num = min(CLASSES, key=lambda c: (per_class[c].registered, c))
+    return class_num, per_class[class_num].registered
+
+
+def _analytics_rows(students: list[Student], now: datetime) -> list[list[Any]]:
+    """Сетка листа «Аналитика». Размер фиксированный, поэтому одна запись полностью перекрывает старую."""
+    students = [s for s in students if s.class_num in CLASSES]
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    windows: list[tuple[str, datetime | None, datetime | None]] = [
+        ("Сегодня", today, None),
+        ("Вчера", today - timedelta(days=1), today),
+        ("7 дней", now - timedelta(days=7), None),
+        ("Всё время", None, None),
+    ]
+
+    passive_class, passive_count = _most_passive(_class_counts(students, now - timedelta(days=7), None))
+    rows: list[list[Any]] = [
+        ["Обновлено:", now.strftime(DATE_FORMAT)],
+        ["Самый пассивный класс за 7 дней:", f"{passive_class} класс ({passive_count} чел.)"],
+        [],
+    ]
+
+    for title, start, end in windows:
+        counts = _class_counts(students, start, end)
+        rows.append([title])
+        rows.append(["Класс", "Зарегались", "Записались", "Без секции"])
+        for c in CLASSES:
+            rows.append([c, counts[c].registered, counts[c].enrolled, counts[c].without_section])
+        rows.append([
+            "Итого",
+            sum(item.registered for item in counts.values()),
+            sum(item.enrolled for item in counts.values()),
+            sum(item.without_section for item in counts.values()),
+        ])
+        rows.append([])
+
+    by_day = _registrations_by_day(students)
+    rows.append([f"По дням (последние {ANALYTICS_BY_DAY_DAYS} дней, регистрации)"])
+    rows.append(["Дата", *[f"{c} кл" for c in CLASSES], "Всего"])
+    for offset in range(ANALYTICS_BY_DAY_DAYS - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        counts = by_day.get(day, {c: 0 for c in CLASSES})
+        rows.append([day.strftime("%d.%m.%Y"), *[counts[c] for c in CLASSES], sum(counts.values())])
+
+    # Выравниваем ширину: пустые ячейки затирают старые значения.
+    return [row + [""] * (ANALYTICS_COLS - len(row)) for row in rows]
+
+
+def _write_analytics_sync() -> None:
+    """Перезаписывает лист «Аналитика» одним запросом values_update (RAW)."""
+    rows = _analytics_rows(_all_students(), _now())
+    try:
+        _ws(ANALYTICS_SHEET)
+    except SheetsError:
+        _spreadsheet().add_worksheet(title=ANALYTICS_SHEET, rows=100, cols=ANALYTICS_COLS)
+        _invalidate("worksheets")
+    _spreadsheet().values_update(
+        f"{_quote_sheet(ANALYTICS_SHEET)}!A1",
+        params={"valueInputOption": "RAW"},
+        body={"values": rows},
+    )
 
 
 def _students_without_section_sync(class_num: int | None) -> list[Student]:
@@ -771,9 +865,25 @@ async def get_student(tg_id: int) -> Student | None:
     return await _run(_find_student, tg_id)
 
 
+async def _refresh_analytics_locked() -> None:
+    """Обновляет лист «Аналитика»; вызывается под _lock. Ошибка не должна ломать действие ученика."""
+    try:
+        await _run(_write_analytics_sync)
+    except SheetsError:
+        logger.exception("Не удалось обновить лист «%s»", ANALYTICS_SHEET)
+
+
+async def refresh_analytics() -> None:
+    """Пересчитать и перезаписать лист «Аналитика» (старт бота, /reload)."""
+    async with _lock:
+        await _run(_write_analytics_sync)
+
+
 async def upsert_student(tg_id: int, name: str, class_num: int, phone: str, lang: str) -> Student:
     async with _lock:
-        return await _run(_upsert_student_sync, tg_id, name, class_num, phone, lang)
+        student = await _run(_upsert_student_sync, tg_id, name, class_num, phone, lang)
+        await _refresh_analytics_locked()
+        return student
 
 
 async def update_student_lang(tg_id: int, lang: str) -> bool:
@@ -787,12 +897,18 @@ async def get_availability(class_num: int) -> list[Availability]:
 
 async def enroll(tg_id: int, section: str) -> EnrollResult:
     async with _lock:
-        return await _run(_enroll_sync, tg_id, section)
+        result = await _run(_enroll_sync, tg_id, section)
+        if result.status is EnrollStatus.OK:
+            await _refresh_analytics_locked()
+        return result
 
 
 async def cancel_enrollment(tg_id: int) -> bool:
     async with _lock:
-        return await _run(_cancel_sync, tg_id)
+        cancelled = await _run(_cancel_sync, tg_id)
+        if cancelled:
+            await _refresh_analytics_locked()
+        return cancelled
 
 
 async def get_stats() -> Stats:

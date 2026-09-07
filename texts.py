@@ -116,7 +116,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "stats_no_deadline": "Дедлайн: не задан",
         "stats_closed": "Запись закрыта",
         "stats_open": "Запись открыта",
-        "reload_done": "Кэш лимитов и настроек сброшен.",
+        "reload_done": "Кэш лимитов и настроек сброшен, лист «Аналитика» обновлён.",
         "export_caption": "Выгрузка записей на {when}",
         # Команды
         "cmd_start": "Начать / Бастау",
