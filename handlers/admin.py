@@ -312,7 +312,8 @@ async def remind_yes(callback: CallbackQuery) -> None:
 
 @router.message(Command("reload"))
 async def cmd_reload(message: Message) -> None:
-    sheets.reload_cache()
-    await sheets.refresh_analytics()
-    logger.info("Админ %s сбросил кэш и обновил лист «%s»", message.from_user.id, sheets.ANALYTICS_SHEET)
+    await sheets.reload()
+    logger.info(
+        "Админ %s перечитал таблицу и обновил лист «%s»", message.from_user.id, sheets.ANALYTICS_SHEET
+    )
     await message.answer(t(LANG, "reload_done"))

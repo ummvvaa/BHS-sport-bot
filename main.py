@@ -86,6 +86,7 @@ async def main() -> None:
         logger.info("Все листы секций на месте")
     await sheets.refresh_analytics()
     logger.info("Лист «%s» обновлён", sheets.ANALYTICS_SHEET)
+    sheets.start_background_tasks()
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
@@ -99,6 +100,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        await sheets.stop_background_tasks()
         await bot.session.close()
 
 

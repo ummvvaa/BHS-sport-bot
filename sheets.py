@@ -1,17 +1,34 @@
 """Слой работы с Google Sheets. Единственное место в проекте, где используется gspread.
 
-gspread синхронный, поэтому все вызовы обёрнуты в asyncio.to_thread.
-Операции записи/отмены сериализуются через asyncio.Lock и повторно проверяют
-лимиты непосредственно перед изменением данных.
+Чтения из Google Sheets — самый дефицитный ресурс (квота «Read requests per
+minute per user»), поэтому таблица целиком держится в памяти:
+
+* «Настройки», «Лимиты», «Ученики» и все листы секций читаются двумя batch-
+  запросами при старте, по /reload и раз в SYNC_INTERVAL_SECONDS;
+* все чтения бота (get_student, доступность секций, /stats, /analytics,
+  /export, напоминания) обслуживаются копией в памяти — без запросов к API;
+* запись (регистрация, запись на секцию, отмена) идёт в таблицу и сразу же
+  применяется к копии, поэтому копия не отстаёт от таблицы;
+* лист «Аналитика» перезаписывается не чаще раза в ANALYTICS_DEBOUNCE_SECONDS.
+
+Google-таблица остаётся источником правды для админа: ручные правки подхватит
+фоновая синхронизация.
+
+gspread синхронный, поэтому все обращения к API обёрнуты в asyncio.to_thread
+и проходят через `_api` (ретраи при 429). Копия в памяти меняется только в
+event loop — из рабочих потоков к ней никто не прикасается, поэтому гонок нет.
+Операции записи сериализуются через asyncio.Lock и перепроверяют лимиты по
+копии непосредственно перед изменением данных.
 """
 from __future__ import annotations
 
 import asyncio
 import functools
 import logging
+import re
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -20,6 +37,7 @@ from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 from gspread.utils import ValueInputOption
 
 from config import settings
@@ -33,13 +51,21 @@ CLASSES: tuple[int, ...] = (8, 9, 10, 11)
 GROUPS: tuple[str, ...] = ("8-9", "10-11")
 CLASS_GROUP: dict[int, str] = {8: "8-9", 9: "8-9", 10: "10-11", 11: "10-11"}
 DATE_FORMAT = "%d.%m.%Y %H:%M"
-CACHE_TTL_SECONDS = 60
+
+# Как часто копия в памяти сверяется с таблицей (ручные правки админа).
+SYNC_INTERVAL_SECONDS = 300
+# Лист «Аналитика» перезаписывается не чаще одного раза за этот интервал.
+ANALYTICS_DEBOUNCE_SECONDS = 60
+# Паузы перед повторами при HTTP 429 (Rate Limit Exceeded).
+RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 8.0)
+RATE_LIMIT_STATUS = 429
 
 SETTINGS_SHEET = "Настройки"
 LIMITS_SHEET = "Лимиты"
 STUDENTS_SHEET = "Ученики"
 ANALYTICS_SHEET = "Аналитика"
-ANALYTICS_COLS = 6
+ANALYTICS_COLS = 8  # самый широкий блок — «Секции — по группам»
+ANALYTICS_ROWS = 200
 ANALYTICS_BY_DAY_DAYS = 14
 STUDENTS_HEADERS: list[str] = [
     "tg_id", "Имя", "Класс", "Телефон", "Язык", "Секция", "Дата записи", "Дата регистрации",
@@ -193,32 +219,6 @@ class Analytics:
 
 
 # --------------------------------------------------------------------------- #
-# Внутреннее состояние модуля: блокировка и кэш
-# --------------------------------------------------------------------------- #
-
-_lock = asyncio.Lock()
-_cache: dict[str, tuple[float, Any]] = {}
-
-
-def _cached(key: str, loader: Callable[[], T]) -> T:
-    entry = _cache.get(key)
-    now = time.monotonic()
-    if entry is not None and now - entry[0] < CACHE_TTL_SECONDS:
-        return entry[1]
-    value = loader()
-    _cache[key] = (now, value)
-    return value
-
-
-def _invalidate(*keys: str) -> None:
-    if keys:
-        for key in keys:
-            _cache.pop(key, None)
-    else:
-        _cache.clear()
-
-
-# --------------------------------------------------------------------------- #
 # Утилиты
 # --------------------------------------------------------------------------- #
 
@@ -232,7 +232,7 @@ def _to_int_or_none(value: Any) -> int | None:
     """Терпимый парсинг: пробелы обрезаются, пустая строка и мусор → None."""
     if value is None:
         return None
-    text = str(value).strip().replace(" ", "").replace(" ", "")
+    text = str(value).strip().replace(" ", "").replace(" ", "")
     if not text:
         return None
     try:
@@ -277,6 +277,52 @@ async def _run(fn: Callable[..., T], *args: Any) -> T:
 
 
 # --------------------------------------------------------------------------- #
+# Вызовы gspread: счётчик запросов и ретраи при 429
+# --------------------------------------------------------------------------- #
+
+_api_calls = 0
+
+
+def api_call_count() -> int:
+    """Сколько запросов к Sheets API сделано за время жизни процесса (диагностика)."""
+    return _api_calls
+
+
+def reset_api_call_count() -> None:
+    global _api_calls
+    _api_calls = 0
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+    return code == RATE_LIMIT_STATUS
+
+
+def _api(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Единственная точка вызова Google API: считает запросы и повторяет при 429.
+
+    Паузы между попытками — RETRY_DELAYS (2, 4, 8 с). Выполняется в рабочем
+    потоке, поэтому time.sleep не блокирует event loop.
+    """
+    global _api_calls
+    for attempt, delay in enumerate((*RETRY_DELAYS, None), start=1):
+        _api_calls += 1
+        try:
+            return fn(*args, **kwargs)
+        except APIError as exc:
+            if delay is None or not _is_rate_limited(exc):
+                raise SheetsError(str(exc)) from exc
+            logger.warning(
+                "Sheets API 429 (попытка %s из %s), повтор через %s с: %s",
+                attempt, len(RETRY_DELAYS) + 1, delay, exc,
+            )
+            time.sleep(delay)
+    raise SheetsError("Не удалось выполнить запрос к Google Sheets.")  # pragma: no cover
+
+
+# --------------------------------------------------------------------------- #
 # Подключение
 # --------------------------------------------------------------------------- #
 
@@ -298,28 +344,43 @@ def _spreadsheet() -> gspread.Spreadsheet:
     return client.open_by_key(settings.spreadsheet_id)
 
 
-def _worksheets() -> dict[str, gspread.Worksheet]:
-    return _cached("worksheets", lambda: {ws.title: ws for ws in _spreadsheet().worksheets()})
+_worksheets_cache: dict[str, gspread.Worksheet] | None = None
+
+
+def _worksheets(*, refresh: bool = False) -> dict[str, gspread.Worksheet]:
+    """Метаданные листов. Кэшируются до /reload: имена листов меняются редко."""
+    global _worksheets_cache
+    if refresh or _worksheets_cache is None:
+        _worksheets_cache = {ws.title: ws for ws in _api(_spreadsheet().worksheets)}
+    return _worksheets_cache
 
 
 def _ws(title: str) -> gspread.Worksheet:
-    sheets = _worksheets()
-    ws = sheets.get(title)
+    ws = _worksheets().get(title)
     if ws is None:
-        _invalidate("worksheets")
-        ws = _worksheets().get(title)
+        ws = _worksheets(refresh=True).get(title)
     if ws is None:
         raise SheetsError(f"Лист «{title}» не найден в таблице.")
     return ws
 
 
+def _batch_get(ranges: list[str]) -> list[list[list[str]]]:
+    """Одним запросом читает несколько диапазонов. Возвращает строки в порядке ranges."""
+    if not ranges:
+        return []
+    response = _api(_spreadsheet().values_batch_get, ranges)
+    value_ranges = response.get("valueRanges", []) if isinstance(response, dict) else []
+    result = [value_range.get("values") or [] for value_range in value_ranges]
+    result.extend([] for _ in range(len(ranges) - len(result)))
+    return result
+
+
 # --------------------------------------------------------------------------- #
-# Настройки и лимиты (кэшируются)
+# Разбор листов
 # --------------------------------------------------------------------------- #
 
 
-def _load_settings() -> dict[str, str]:
-    rows = _ws(SETTINGS_SHEET).get_all_values()
+def _parse_settings(rows: list[list[str]]) -> dict[str, str]:
     result: dict[str, str] = {}
     for row in rows:
         key = _cell(row, 0)
@@ -328,40 +389,8 @@ def _load_settings() -> dict[str, str]:
     return result
 
 
-def _get_settings() -> dict[str, str]:
-    return _cached("settings", _load_settings)
-
-
-def _parse_deadline(raw: str) -> datetime | None:
-    raw = raw.strip()
-    if not raw:
-        return None
-    for fmt in DEADLINE_FORMATS:
-        try:
-            return datetime.strptime(raw, fmt).replace(tzinfo=TZ)
-        except ValueError:
-            continue
-    logger.warning(
-        "Не удалось разобрать deadline %r в листе «%s». Ожидается формат YYYY-MM-DD HH:MM. "
-        "Дедлайн считается не заданным.",
-        raw,
-        SETTINGS_SHEET,
-    )
-    return None
-
-
-def _get_deadline() -> datetime | None:
-    return _parse_deadline(_get_settings().get("deadline", ""))
-
-
-def _is_closed() -> bool:
-    deadline = _get_deadline()
-    return deadline is not None and _now() >= deadline
-
-
-def _load_limits() -> list[SectionLimit]:
-    """Читает лист «Лимиты»: Секция | 8-9 | 10-11. Секции без лимитов в обеих группах отбрасываются."""
-    rows = _ws(LIMITS_SHEET).get_all_values()
+def _parse_limits(rows: list[list[str]]) -> list[SectionLimit]:
+    """Разбирает лист «Лимиты»: Секция | 8-9 | 10-11. Секции без лимитов отбрасываются."""
     if not rows:
         return []
     header = [h.strip().lower().replace(" ", "") for h in rows[0]]
@@ -396,15 +425,6 @@ def _load_limits() -> list[SectionLimit]:
     return limits
 
 
-def _get_limits() -> list[SectionLimit]:
-    return _cached("limits", _load_limits)
-
-
-# --------------------------------------------------------------------------- #
-# Лист «Ученики»
-# --------------------------------------------------------------------------- #
-
-
 def _parse_student(row: list[str], row_number: int) -> Student | None:
     tg_raw = _cell(row, 0)
     if not tg_raw.lstrip("-").isdigit():
@@ -423,70 +443,21 @@ def _parse_student(row: list[str], row_number: int) -> Student | None:
     )
 
 
-def _all_students() -> list[Student]:
-    rows = _ws(STUDENTS_SHEET).get_all_values()
-    students: list[Student] = []
+def _parse_students(rows: list[list[str]]) -> dict[int, Student]:
+    """Строки листа «Ученики» (начиная с заголовка) → копия в памяти по tg_id."""
+    students: dict[int, Student] = {}
     for index, row in enumerate(rows[1:], start=2):
         student = _parse_student(row, index)
-        if student is not None:
-            students.append(student)
-    return students
-
-
-def _find_student(tg_id: int) -> Student | None:
-    for student in _all_students():
-        if student.tg_id == tg_id:
-            return student
-    return None
-
-
-def _upsert_student_sync(tg_id: int, name: str, class_num: int, phone: str, lang: str) -> Student:
-    ws = _ws(STUDENTS_SHEET)
-    existing = _find_student(tg_id)
-    if existing is None:
-        ws.append_row(
-            [str(tg_id), name, str(class_num), phone, lang, "", "", _now_str()],
-            value_input_option=ValueInputOption.raw,
-        )
-        student = _find_student(tg_id)
         if student is None:
-            raise SheetsError("Не удалось прочитать только что добавленную строку ученика.")
-        return student
-
-    # При перерегистрации обновляются только A:E; секция, даты записи и регистрации сохраняются.
-    ws.update(
-        range_name=f"A{existing.row}:E{existing.row}",
-        values=[[str(tg_id), name, str(class_num), phone, lang]],
-        value_input_option=ValueInputOption.raw,
-    )
-    return Student(
-        tg_id=tg_id,
-        name=name,
-        class_num=class_num,
-        phone=phone,
-        lang=lang,
-        section=existing.section,
-        enrolled_at=existing.enrolled_at,
-        registered_at=existing.registered_at,
-        row=existing.row,
-    )
-
-
-def _update_lang_sync(tg_id: int, lang: str) -> bool:
-    student = _find_student(tg_id)
-    if student is None:
-        return False
-    _ws(STUDENTS_SHEET).update(
-        range_name=f"E{student.row}",
-        values=[[lang]],
-        value_input_option=ValueInputOption.raw,
-    )
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# Листы секций
-# --------------------------------------------------------------------------- #
+            continue
+        if student.tg_id in students:
+            logger.warning(
+                "В листе «%s» повторяется tg_id %s (строки %s и %s) — берём первую",
+                STUDENTS_SHEET, student.tg_id, students[student.tg_id].row, student.row,
+            )
+            continue
+        students[student.tg_id] = student
+    return students
 
 
 def _parse_enrollment(row: list[str], row_number: int) -> Enrollment | None:
@@ -504,35 +475,141 @@ def _parse_enrollment(row: list[str], row_number: int) -> Enrollment | None:
     )
 
 
-def _section_enrollments(limits: list[SectionLimit]) -> dict[str, list[Enrollment]]:
-    """Читает записи всех секций одним batch-запросом."""
+# --------------------------------------------------------------------------- #
+# Копия таблицы в памяти
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    settings: dict[str, str]
+    limits: list[SectionLimit]
+    students: dict[int, Student]
+    enrollments: dict[str, list[Enrollment]]
+
+
+class _Store:
+    """Копия листов «Настройки», «Лимиты», «Ученики» и листов секций.
+
+    Меняется только в event loop, поэтому синхронизация не нужна.
+    """
+
+    def __init__(self) -> None:
+        self.settings: dict[str, str] = {}
+        self.limits: list[SectionLimit] = []
+        self.students: dict[int, Student] = {}
+        self.enrollments: dict[str, list[Enrollment]] = {}
+        self.loaded = False
+        self.synced_at: float | None = None
+
+    def apply(self, snapshot: _Snapshot) -> None:
+        self.settings = snapshot.settings
+        self.limits = snapshot.limits
+        self.students = snapshot.students
+        self.enrollments = snapshot.enrollments
+        self.loaded = True
+        self.synced_at = time.monotonic()
+
+    def clear(self) -> None:
+        self.settings = {}
+        self.limits = []
+        self.students = {}
+        self.enrollments = {}
+        self.loaded = False
+        self.synced_at = None
+
+    def section(self, name: str) -> list[Enrollment]:
+        return self.enrollments.setdefault(name, [])
+
+    def limit(self, name: str) -> SectionLimit | None:
+        return next((item for item in self.limits if item.name == name), None)
+
+    def students_list(self) -> list[Student]:
+        return sorted(self.students.values(), key=lambda s: s.row)
+
+
+_store = _Store()
+_lock = asyncio.Lock()  # сериализует запись и полную пересинхронизацию копии
+
+
+def _load_base_sync() -> tuple[dict[str, str], list[SectionLimit], dict[int, Student], list[str]]:
+    """Одним запросом читает «Настройки», «Лимиты» и «Ученики» (+строку заголовков)."""
+    values = _batch_get([
+        f"{_quote_sheet(SETTINGS_SHEET)}!A:B",
+        f"{_quote_sheet(LIMITS_SHEET)}!A:Z",
+        f"{_quote_sheet(STUDENTS_SHEET)}!A:H",
+    ])
+    students_rows = values[2]
+    header = [str(cell).strip() for cell in students_rows[0]] if students_rows else []
+    return _parse_settings(values[0]), _parse_limits(values[1]), _parse_students(students_rows), header
+
+
+def _load_enrollments_sync(limits: list[SectionLimit]) -> dict[str, list[Enrollment]]:
+    """Одним batch-запросом читает записи всех листов секций."""
+    result: dict[str, list[Enrollment]] = {limit.name: [] for limit in limits}
     if not limits:
-        return {}
+        return result
     ranges = [f"{_quote_sheet(limit.name)}!A2:E" for limit in limits]
-    response = _spreadsheet().values_batch_get(ranges)
-    value_ranges = response.get("valueRanges", [])
-    result: dict[str, list[Enrollment]] = {}
-    for limit, value_range in zip(limits, value_ranges, strict=False):
-        rows = value_range.get("values", [])
+    for limit, rows in zip(limits, _batch_get(ranges), strict=False):
         enrollments: list[Enrollment] = []
         for index, row in enumerate(rows, start=2):
             enrollment = _parse_enrollment(row, index)
             if enrollment is not None:
                 enrollments.append(enrollment)
         result[limit.name] = enrollments
-    for limit in limits:
-        result.setdefault(limit.name, [])
     return result
 
 
-def _single_section_enrollments(section: str) -> list[Enrollment]:
-    rows = _ws(section).get_all_values()
-    enrollments: list[Enrollment] = []
-    for index, row in enumerate(rows[1:], start=2):
-        enrollment = _parse_enrollment(row, index)
-        if enrollment is not None:
-            enrollments.append(enrollment)
-    return enrollments
+def _load_snapshot_sync() -> _Snapshot:
+    """Полное чтение таблицы: ровно два запроса к API."""
+    settings_map, limits, students, _ = _load_base_sync()
+    return _Snapshot(settings_map, limits, students, _load_enrollments_sync(limits))
+
+
+async def _ensure_loaded() -> None:
+    """Гарантирует, что копия в памяти заполнена (единственное чтение при холодном старте)."""
+    if _store.loaded:
+        return
+    async with _lock:
+        if _store.loaded:
+            return
+        _store.apply(await _run(_load_snapshot_sync))
+        logger.info(
+            "Копия таблицы загружена: учеников %s, секций %s",
+            len(_store.students), len(_store.limits),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Настройки, лимиты, доступность — всё из копии
+# --------------------------------------------------------------------------- #
+
+
+def _parse_deadline(raw: str) -> datetime | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    for fmt in DEADLINE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    logger.warning(
+        "Не удалось разобрать deadline %r в листе «%s». Ожидается формат YYYY-MM-DD HH:MM. "
+        "Дедлайн считается не заданным.",
+        raw,
+        SETTINGS_SHEET,
+    )
+    return None
+
+
+def _deadline() -> datetime | None:
+    return _parse_deadline(_store.settings.get("deadline", ""))
+
+
+def _closed() -> bool:
+    deadline = _deadline()
+    return deadline is not None and _now() >= deadline
 
 
 def _count(enrollments: list[Enrollment]) -> tuple[int, dict[str, int]]:
@@ -551,16 +628,16 @@ def _free_for_group(limit: SectionLimit, enrollments: list[Enrollment], group: s
     return max(limit.group_limit(group) - by_group.get(group, 0), 0)
 
 
-def _availability_sync(class_num: int) -> list[Availability]:
+def _availability(class_num: int) -> list[Availability]:
     """Секции для группы ученика. Секции с пустым/нулевым лимитом группы не попадают в список."""
     group = group_of(class_num)
     if group is None:
         return []
-    limits = [limit for limit in _get_limits() if limit.group_limit(group) > 0]
-    enrollments = _section_enrollments(limits)
     result: list[Availability] = []
-    for limit in limits:
-        items = enrollments.get(limit.name, [])
+    for limit in _store.limits:
+        if limit.group_limit(group) <= 0:
+            continue
+        items = _store.section(limit.name)
         total, _ = _count(items)
         free_group = _free_for_group(limit, items, group)
         result.append(
@@ -574,134 +651,172 @@ def _availability_sync(class_num: int) -> list[Availability]:
     return result
 
 
-def _ensure_section_sheets_sync() -> list[str]:
+# --------------------------------------------------------------------------- #
+# Запись в таблицу (выполняется в потоке, копию не трогает)
+# --------------------------------------------------------------------------- #
+
+_RANGE_ROW_RE = re.compile(r"![A-Za-z]+(\d+)")
+
+
+def _appended_row(response: Any, fallback: int) -> int:
+    """Номер добавленной строки из ответа values.append — чтобы не перечитывать лист."""
+    updates = response.get("updates") if isinstance(response, dict) else None
+    updated_range = updates.get("updatedRange", "") if isinstance(updates, dict) else ""
+    match = _RANGE_ROW_RE.search(str(updated_range))
+    if match:
+        return int(match.group(1))
+    logger.warning("Не удалось определить номер строки из ответа API (%r)", updated_range)
+    return fallback
+
+
+def _next_row(rows: list[int]) -> int:
+    return max(rows) + 1 if rows else 2
+
+
+def _append_student_sync(
+    tg_id: int, name: str, class_num: int, phone: str, lang: str, registered_at: str, fallback: int
+) -> int:
+    response = _api(
+        _ws(STUDENTS_SHEET).append_row,
+        [str(tg_id), name, str(class_num), phone, lang, "", "", registered_at],
+        value_input_option=ValueInputOption.raw,
+    )
+    return _appended_row(response, fallback)
+
+
+def _update_student_sync(row: int, tg_id: int, name: str, class_num: int, phone: str, lang: str) -> None:
+    # При перерегистрации обновляются только A:E; секция, даты записи и регистрации сохраняются.
+    _api(
+        _ws(STUDENTS_SHEET).update,
+        range_name=f"A{row}:E{row}",
+        values=[[str(tg_id), name, str(class_num), phone, lang]],
+        value_input_option=ValueInputOption.raw,
+    )
+
+
+def _update_lang_sync(row: int, lang: str) -> None:
+    _api(
+        _ws(STUDENTS_SHEET).update,
+        range_name=f"E{row}",
+        values=[[lang]],
+        value_input_option=ValueInputOption.raw,
+    )
+
+
+def _append_enrollment_sync(section: str, student: Student, when: str, fallback: int) -> int:
+    response = _api(
+        _ws(section).append_row,
+        [student.name, str(student.class_num), student.phone, str(student.tg_id), when],
+        value_input_option=ValueInputOption.raw,
+    )
+    return _appended_row(response, fallback)
+
+
+def _set_student_section_sync(row: int, section: str, when: str) -> None:
+    _api(
+        _ws(STUDENTS_SHEET).update,
+        range_name=f"F{row}:G{row}",
+        values=[[section, when]],
+        value_input_option=ValueInputOption.raw,
+    )
+
+
+def _cancel_sync(section: str, rows: list[int], student_row: int) -> None:
+    if rows:
+        try:
+            ws = _ws(section)
+        except SheetsError:
+            ws = None  # лист секции удалён вручную — чистим только «Учеников»
+        if ws is not None:
+            for row in sorted(rows, reverse=True):  # снизу вверх, чтобы индексы не сдвигались
+                _api(ws.delete_rows, row)
+    _api(
+        _ws(STUDENTS_SHEET).update,
+        range_name=f"F{student_row}:G{student_row}",
+        values=[["", ""]],
+        value_input_option=ValueInputOption.raw,
+    )
+
+
+def _drop_enrollment_rows(section: str, tg_id: int, removed: list[int]) -> None:
+    """Убирает записи ученика из копии и сдвигает номера строк ниже удалённых."""
+    kept: list[Enrollment] = []
+    for item in _store.section(section):
+        if item.tg_id == tg_id:
+            continue
+        offset = sum(1 for row in removed if row < item.row)
+        kept.append(replace(item, row=item.row - offset) if offset else item)
+    _store.enrollments[section] = kept
+
+
+def _ensure_section_sheets_sync() -> tuple[list[str], _Snapshot]:
+    """Проверяет обязательные листы, создаёт недостающие листы секций и читает всю таблицу."""
     sh = _spreadsheet()
-    _invalidate("worksheets", "limits")
-    existing = _worksheets()
+    existing = _worksheets(refresh=True)
     for required in (SETTINGS_SHEET, LIMITS_SHEET, STUDENTS_SHEET):
         if required not in existing:
             raise SheetsError(
                 f"В таблице нет обязательного листа «{required}». Создай его вручную (см. README)."
             )
 
-    students_ws = existing[STUDENTS_SHEET]
-    header = [cell.strip() for cell in students_ws.row_values(1)]
+    settings_map, limits, students, header = _load_base_sync()
     if not header or len(header) < len(STUDENTS_HEADERS):
         # Пустой лист или старая схема без «Дата регистрации» — дописываем заголовки.
-        students_ws.update(
+        _api(
+            existing[STUDENTS_SHEET].update,
             range_name="A1",
             values=[STUDENTS_HEADERS],
             value_input_option=ValueInputOption.raw,
         )
 
     if ANALYTICS_SHEET not in existing:
-        sh.add_worksheet(title=ANALYTICS_SHEET, rows=100, cols=ANALYTICS_COLS)
-        _invalidate("worksheets")
+        _api(sh.add_worksheet, title=ANALYTICS_SHEET, rows=ANALYTICS_ROWS, cols=ANALYTICS_COLS)
+        _worksheets(refresh=True)
         logger.info("Создан лист «%s»", ANALYTICS_SHEET)
 
     created: list[str] = []
-    for limit in _get_limits():
+    for limit in limits:
         if limit.name in existing:
             continue
-        ws = sh.add_worksheet(title=limit.name, rows=200, cols=len(SECTION_HEADERS))
-        ws.update(
+        ws = _api(sh.add_worksheet, title=limit.name, rows=200, cols=len(SECTION_HEADERS))
+        _api(
+            ws.update,
             range_name="A1",
             values=[SECTION_HEADERS],
             value_input_option=ValueInputOption.raw,
         )
         created.append(limit.name)
     if created:
-        _invalidate("worksheets")
-    return created
+        _worksheets(refresh=True)
+
+    snapshot = _Snapshot(settings_map, limits, students, _load_enrollments_sync(limits))
+    return created, snapshot
 
 
 # --------------------------------------------------------------------------- #
-# Запись и отмена (вызываются только под _lock)
+# Статистика, экспорт, аналитика — всё считается по копии
 # --------------------------------------------------------------------------- #
 
 
-def _enroll_sync(tg_id: int, section: str) -> EnrollResult:
-    student = _find_student(tg_id)
-    if student is None:
-        return EnrollResult(EnrollStatus.NOT_REGISTERED)
-    if student.section:
-        return EnrollResult(EnrollStatus.ALREADY, student.section)
-
-    limit = next((item for item in _get_limits() if item.name == section), None)
-    if limit is None:
-        return EnrollResult(EnrollStatus.UNKNOWN_SECTION)
-    group = group_of(student.class_num)
-    if limit.group_limit(group) <= 0:
-        return EnrollResult(EnrollStatus.FULL, section)
-
-    # Повторная проверка лимита группы по свежим данным непосредственно перед записью.
-    enrollments = _single_section_enrollments(section)
-    if any(item.tg_id == tg_id for item in enrollments):
-        return EnrollResult(EnrollStatus.ALREADY, section)
-    if _free_for_group(limit, enrollments, group) <= 0:
-        return EnrollResult(EnrollStatus.FULL, section)
-
-    when = _now_str()
-    _ws(section).append_row(
-        [student.name, str(student.class_num), student.phone, str(tg_id), when],
-        value_input_option=ValueInputOption.raw,
-    )
-    _ws(STUDENTS_SHEET).update(
-        range_name=f"F{student.row}:G{student.row}",
-        values=[[section, when]],
-        value_input_option=ValueInputOption.raw,
-    )
-    return EnrollResult(EnrollStatus.OK, section)
+def _sections_snapshot() -> list[tuple[SectionLimit, list[Enrollment]]]:
+    """Секции в порядке листа «Лимиты» (скрытые уже отфильтрованы) + копии их записей."""
+    return [(limit, list(_store.section(limit.name))) for limit in _store.limits]
 
 
-def _cancel_sync(tg_id: int) -> bool:
-    student = _find_student(tg_id)
-    if student is None or not student.section:
-        return False
-
-    section = student.section
-    try:
-        ws = _ws(section)
-    except SheetsError:
-        ws = None
-    if ws is not None:
-        # Удаляем снизу вверх, чтобы индексы не сдвигались.
-        rows = [item.row for item in _single_section_enrollments(section) if item.tg_id == tg_id]
-        for row in sorted(rows, reverse=True):
-            ws.delete_rows(row)
-
-    _ws(STUDENTS_SHEET).update(
-        range_name=f"F{student.row}:G{student.row}",
-        values=[["", ""]],
-        value_input_option=ValueInputOption.raw,
-    )
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# Статистика, экспорт, аналитика
-# --------------------------------------------------------------------------- #
-
-
-def _collect_sync() -> ExportData:
-    limits = _get_limits()
-    enrollments = _section_enrollments(limits)
-    students = _all_students()
-
+def _collect() -> ExportData:
+    sections = _sections_snapshot()
     section_stats: list[SectionStats] = []
-    sections: list[tuple[SectionLimit, list[Enrollment]]] = []
-    for limit in limits:
-        items = enrollments.get(limit.name, [])
+    for limit, items in sections:
         total, by_group = _count(items)
         section_stats.append(SectionStats(limit=limit, count_total=total, count_by_group=by_group))
-        sections.append((limit, items))
 
+    students = _store.students.values()
     stats = Stats(
         sections=section_stats,
         registered=len(students),
         enrolled=sum(1 for s in students if s.section),
-        deadline=_get_deadline(),
-        closed=_is_closed(),
+        deadline=_deadline(),
+        closed=_closed(),
     )
     return ExportData(sections=sections, stats=stats)
 
@@ -750,9 +865,9 @@ def _registrations_by_day(students: list[Student]) -> dict[datetime, dict[int, i
     return by_day
 
 
-def _analytics_sync(days: int | None) -> Analytics:
+def _analytics(days: int | None) -> Analytics:
     """Статистика по каждому классу за всё время или за последние `days` дней (по дате регистрации)."""
-    students = [s for s in _all_students() if s.class_num in CLASSES]
+    students = [s for s in _store.students.values() if s.class_num in CLASSES]
     cutoff = _now() - timedelta(days=days) if days else None
     per_class = _class_counts(students, cutoff, None)
 
@@ -772,7 +887,58 @@ def _most_passive(per_class: dict[int, ClassAnalytics]) -> tuple[int, int]:
     return class_num, per_class[class_num].registered
 
 
-def _analytics_rows(students: list[Student], now: datetime) -> list[list[Any]]:
+SectionRows = list[tuple[SectionLimit, list[Enrollment]]]
+
+
+def _by_class(enrollments: list[Enrollment]) -> dict[int, int]:
+    counts = {c: 0 for c in CLASSES}
+    for item in enrollments:
+        if item.class_num in counts:
+            counts[item.class_num] += 1
+    return counts
+
+
+def _sections_by_group_rows(sections: SectionRows) -> list[list[Any]]:
+    """Секция | <группа> занято | лимит | осталось | ... | Всего записано."""
+    rows: list[list[Any]] = [
+        ["СЕКЦИИ — ПО ГРУППАМ"],
+        ["Секция", *[f"{group} {what}" for group in GROUPS for what in ("занято", "лимит", "осталось")],
+         "Всего записано"],
+    ]
+    totals = [0] * (len(GROUPS) * 3 + 1)
+    for limit, items in sections:
+        _, by_group = _count(items)
+        values: list[int] = []
+        for group in GROUPS:
+            taken = by_group.get(group, 0)
+            allowed = limit.group_limit(group)
+            values += [taken, allowed, max(allowed - taken, 0)]
+        values.append(len(items))
+        rows.append([limit.name, *values])
+        totals = [total + value for total, value in zip(totals, values, strict=True)]
+    rows.append(["ИТОГО", *totals])
+    rows.append([])
+    return rows
+
+
+def _sections_by_class_rows(sections: SectionRows) -> list[list[Any]]:
+    """Секция | 8 кл | 9 кл | 10 кл | 11 кл | Всего."""
+    rows: list[list[Any]] = [
+        ["СЕКЦИИ — ПО КЛАССАМ"],
+        ["Секция", *[f"{c} кл" for c in CLASSES], "Всего"],
+    ]
+    totals = {c: 0 for c in CLASSES}
+    for limit, items in sections:
+        counts = _by_class(items)
+        rows.append([limit.name, *[counts[c] for c in CLASSES], sum(counts.values())])
+        for c in CLASSES:
+            totals[c] += counts[c]
+    rows.append(["ИТОГО", *[totals[c] for c in CLASSES], sum(totals.values())])
+    rows.append([])
+    return rows
+
+
+def _analytics_rows(students: list[Student], sections: SectionRows, now: datetime) -> list[list[Any]]:
     """Сетка листа «Аналитика». Размер фиксированный, поэтому одна запись полностью перекрывает старую."""
     students = [s for s in students if s.class_num in CLASSES]
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -788,6 +954,8 @@ def _analytics_rows(students: list[Student], now: datetime) -> list[list[Any]]:
         ["Обновлено:", now.strftime(DATE_FORMAT)],
         ["Самый пассивный класс за 7 дней:", f"{passive_class} класс ({passive_count} чел.)"],
         [],
+        *_sections_by_group_rows(sections),
+        *_sections_by_class_rows(sections),
     ]
 
     for title, start, end in windows:
@@ -816,26 +984,134 @@ def _analytics_rows(students: list[Student], now: datetime) -> list[list[Any]]:
     return [row + [""] * (ANALYTICS_COLS - len(row)) for row in rows]
 
 
-def _write_analytics_sync() -> None:
+def _ensure_analytics_grid(ws: gspread.Worksheet, rows_needed: int) -> None:
+    """Расширяет лист, если сетка уже, чем данные. Размеры берутся из метаданных, без чтения."""
+    if ws.col_count < ANALYTICS_COLS:
+        _api(ws.resize, cols=ANALYTICS_COLS)
+        logger.info("Лист «%s» расширен до %s колонок", ANALYTICS_SHEET, ANALYTICS_COLS)
+    if ws.row_count < rows_needed:
+        _api(ws.resize, rows=max(rows_needed, ANALYTICS_ROWS))
+        logger.info("Лист «%s» расширен до %s строк", ANALYTICS_SHEET, ws.row_count)
+
+
+def _write_analytics_sync(students: list[Student], sections: SectionRows, now: datetime) -> None:
     """Перезаписывает лист «Аналитика» одним запросом values_update (RAW)."""
-    rows = _analytics_rows(_all_students(), _now())
+    rows = _analytics_rows(students, sections, now)
     try:
-        _ws(ANALYTICS_SHEET)
+        ws = _ws(ANALYTICS_SHEET)
     except SheetsError:
-        _spreadsheet().add_worksheet(title=ANALYTICS_SHEET, rows=100, cols=ANALYTICS_COLS)
-        _invalidate("worksheets")
-    _spreadsheet().values_update(
+        ws = _api(_spreadsheet().add_worksheet, title=ANALYTICS_SHEET,
+                  rows=ANALYTICS_ROWS, cols=ANALYTICS_COLS)
+        _worksheets(refresh=True)
+    _ensure_analytics_grid(ws, len(rows))
+    _api(
+        _spreadsheet().values_update,
         f"{_quote_sheet(ANALYTICS_SHEET)}!A1",
         params={"valueInputOption": "RAW"},
         body={"values": rows},
     )
 
 
-def _students_without_section_sync(class_num: int | None) -> list[Student]:
-    return [
-        s for s in _all_students()
-        if not s.section and (class_num is None or s.class_num == class_num)
-    ]
+# --------------------------------------------------------------------------- #
+# Отложенная (debounce) запись листа «Аналитика»
+# --------------------------------------------------------------------------- #
+
+_analytics_dirty = False
+
+
+def _mark_analytics_dirty() -> None:
+    """Помечает аналитику устаревшей: её перезапишет фоновый таймер, а не сам хендлер."""
+    global _analytics_dirty
+    _analytics_dirty = True
+
+
+def analytics_pending() -> bool:
+    return _analytics_dirty
+
+
+async def _write_analytics() -> None:
+    await _run(_write_analytics_sync, _store.students_list(), _sections_snapshot(), _now())
+
+
+async def flush_analytics() -> bool:
+    """Записывает «Аналитику», если с прошлой записи что-то менялось. True — если писали."""
+    global _analytics_dirty
+    if not _analytics_dirty:
+        return False
+    _analytics_dirty = False
+    try:
+        await _write_analytics()
+    except SheetsError:
+        _analytics_dirty = True  # попробуем на следующем тике
+        logger.exception("Не удалось обновить лист «%s»", ANALYTICS_SHEET)
+        return False
+    return True
+
+
+async def refresh_analytics() -> None:
+    """Пересчитать и перезаписать лист «Аналитика» немедленно (старт бота, /reload)."""
+    global _analytics_dirty
+    await _ensure_loaded()
+    _analytics_dirty = False
+    try:
+        await _write_analytics()
+    except SheetsError:
+        _analytics_dirty = True  # не потеряли изменения: допишет таймер
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Фоновые задачи: синхронизация копии и debounce аналитики
+# --------------------------------------------------------------------------- #
+
+_tasks: list[asyncio.Task[None]] = []
+
+
+async def _every(interval: float, action: Callable[[], Coroutine[Any, Any, Any]], what: str) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await action()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — фоновая задача не должна умирать
+            logger.exception("Фоновая задача «%s» упала, продолжаем", what)
+
+
+def start_background_tasks() -> None:
+    """Запускает синхронизацию копии (5 мин) и отложенную запись аналитики (60 с)."""
+    if _tasks:
+        return
+    _tasks.append(asyncio.create_task(
+        _every(SYNC_INTERVAL_SECONDS, refresh, "синхронизация копии"),
+        name="sheets-sync",
+    ))
+    _tasks.append(asyncio.create_task(
+        _every(ANALYTICS_DEBOUNCE_SECONDS, flush_analytics, "запись аналитики"),
+        name="sheets-analytics",
+    ))
+    logger.info(
+        "Фоновая синхронизация каждые %s с, запись «%s» — не чаще раза в %s с",
+        SYNC_INTERVAL_SECONDS, ANALYTICS_SHEET, ANALYTICS_DEBOUNCE_SECONDS,
+    )
+
+
+async def stop_background_tasks() -> None:
+    """Останавливает фоновые задачи и дописывает отложенную аналитику."""
+    for task in _tasks:
+        task.cancel()
+    for task in _tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — остановка не должна падать
+            logger.exception("Фоновая задача %s завершилась с ошибкой", task.get_name())
+    _tasks.clear()
+    try:
+        await flush_analytics()
+    except SheetsError:
+        logger.exception("Не удалось дописать лист «%s» при остановке", ANALYTICS_SHEET)
 
 
 # --------------------------------------------------------------------------- #
@@ -844,89 +1120,160 @@ def _students_without_section_sync(class_num: int | None) -> list[Student]:
 
 
 async def ensure_section_sheets() -> list[str]:
-    """Создаёт недостающие листы секций. Возвращает имена созданных листов."""
+    """Создаёт недостающие листы секций и заполняет копию. Возвращает имена созданных листов."""
     async with _lock:
-        return await _run(_ensure_section_sheets_sync)
+        created, snapshot = await _run(_ensure_section_sheets_sync)
+        _store.apply(snapshot)
+        return created
+
+
+async def refresh() -> None:
+    """Сверяет копию в памяти с таблицей (два запроса на чтение)."""
+    async with _lock:
+        _store.apply(await _run(_load_snapshot_sync))
+    logger.debug("Копия синхронизирована: учеников %s", len(_store.students))
+
+
+async def reload() -> None:
+    """/reload: заново читает метаданные листов, копию таблицы и перезаписывает аналитику."""
+    async with _lock:
+        await _run(_worksheets_refresh_sync)
+        _store.apply(await _run(_load_snapshot_sync))
+    await refresh_analytics()
+
+
+def _worksheets_refresh_sync() -> None:
+    _worksheets(refresh=True)
 
 
 async def is_closed() -> bool:
-    return await _run(_is_closed)
+    await _ensure_loaded()
+    return _closed()
 
 
 async def get_deadline() -> datetime | None:
-    return await _run(_get_deadline)
+    await _ensure_loaded()
+    return _deadline()
 
 
 async def get_limits() -> list[SectionLimit]:
-    return await _run(_get_limits)
+    await _ensure_loaded()
+    return list(_store.limits)
 
 
 async def get_student(tg_id: int) -> Student | None:
-    return await _run(_find_student, tg_id)
-
-
-async def _refresh_analytics_locked() -> None:
-    """Обновляет лист «Аналитика»; вызывается под _lock. Ошибка не должна ломать действие ученика."""
-    try:
-        await _run(_write_analytics_sync)
-    except SheetsError:
-        logger.exception("Не удалось обновить лист «%s»", ANALYTICS_SHEET)
-
-
-async def refresh_analytics() -> None:
-    """Пересчитать и перезаписать лист «Аналитика» (старт бота, /reload)."""
-    async with _lock:
-        await _run(_write_analytics_sync)
+    await _ensure_loaded()
+    return _store.students.get(tg_id)
 
 
 async def upsert_student(tg_id: int, name: str, class_num: int, phone: str, lang: str) -> Student:
+    await _ensure_loaded()
     async with _lock:
-        student = await _run(_upsert_student_sync, tg_id, name, class_num, phone, lang)
-        await _refresh_analytics_locked()
+        existing = _store.students.get(tg_id)
+        if existing is None:
+            registered_at = _now_str()
+            fallback = _next_row([s.row for s in _store.students.values()])
+            row = await _run(
+                _append_student_sync, tg_id, name, class_num, phone, lang, registered_at, fallback
+            )
+            student = Student(
+                tg_id=tg_id, name=name, class_num=class_num, phone=phone, lang=lang,
+                section=None, enrolled_at=None, registered_at=registered_at, row=row,
+            )
+        else:
+            await _run(_update_student_sync, existing.row, tg_id, name, class_num, phone, lang)
+            student = replace(existing, name=name, class_num=class_num, phone=phone, lang=lang)
+        _store.students[tg_id] = student
+        _mark_analytics_dirty()
         return student
 
 
 async def update_student_lang(tg_id: int, lang: str) -> bool:
+    await _ensure_loaded()
     async with _lock:
-        return await _run(_update_lang_sync, tg_id, lang)
+        student = _store.students.get(tg_id)
+        if student is None:
+            return False
+        await _run(_update_lang_sync, student.row, lang)
+        _store.students[tg_id] = replace(student, lang=lang)
+        return True
 
 
 async def get_availability(class_num: int) -> list[Availability]:
-    return await _run(_availability_sync, class_num)
+    await _ensure_loaded()
+    return _availability(class_num)
 
 
 async def enroll(tg_id: int, section: str) -> EnrollResult:
+    await _ensure_loaded()
     async with _lock:
-        result = await _run(_enroll_sync, tg_id, section)
-        if result.status is EnrollStatus.OK:
-            await _refresh_analytics_locked()
-        return result
+        student = _store.students.get(tg_id)
+        if student is None:
+            return EnrollResult(EnrollStatus.NOT_REGISTERED)
+        if student.section:
+            return EnrollResult(EnrollStatus.ALREADY, student.section)
+
+        limit = _store.limit(section)
+        if limit is None:
+            return EnrollResult(EnrollStatus.UNKNOWN_SECTION)
+        group = group_of(student.class_num)
+        if limit.group_limit(group) <= 0:
+            return EnrollResult(EnrollStatus.FULL, section)
+
+        # Лимит проверяется по копии под _lock: параллельные записи не обгонят друг друга.
+        items = _store.section(section)
+        if any(item.tg_id == tg_id for item in items):
+            return EnrollResult(EnrollStatus.ALREADY, section)
+        if _free_for_group(limit, items, group) <= 0:
+            return EnrollResult(EnrollStatus.FULL, section)
+
+        when = _now_str()
+        row = await _run(
+            _append_enrollment_sync, section, student, when, _next_row([i.row for i in items])
+        )
+        items.append(Enrollment(
+            name=student.name, class_num=student.class_num, phone=student.phone,
+            tg_id=tg_id, enrolled_at=when, row=row,
+        ))
+        await _run(_set_student_section_sync, student.row, section, when)
+        _store.students[tg_id] = replace(student, section=section, enrolled_at=when)
+        _mark_analytics_dirty()
+        return EnrollResult(EnrollStatus.OK, section)
 
 
 async def cancel_enrollment(tg_id: int) -> bool:
+    await _ensure_loaded()
     async with _lock:
-        cancelled = await _run(_cancel_sync, tg_id)
-        if cancelled:
-            await _refresh_analytics_locked()
-        return cancelled
+        student = _store.students.get(tg_id)
+        if student is None or not student.section:
+            return False
+        section = student.section
+        removed = sorted((i.row for i in _store.section(section) if i.tg_id == tg_id), reverse=True)
+        await _run(_cancel_sync, section, removed, student.row)
+        _drop_enrollment_rows(section, tg_id, removed)
+        _store.students[tg_id] = replace(student, section=None, enrolled_at=None)
+        _mark_analytics_dirty()
+        return True
 
 
 async def get_stats() -> Stats:
-    return (await _run(_collect_sync)).stats
+    await _ensure_loaded()
+    return _collect().stats
 
 
 async def get_export_data() -> ExportData:
-    return await _run(_collect_sync)
+    await _ensure_loaded()
+    return _collect()
 
 
 async def get_analytics(days: int | None = None) -> Analytics:
-    return await _run(_analytics_sync, days)
+    await _ensure_loaded()
+    return _analytics(days)
 
 
 async def get_students_without_section(class_num: int | None = None) -> list[Student]:
-    return await _run(_students_without_section_sync, class_num)
-
-
-def reload_cache() -> None:
-    """Сбрасывает кэш лимитов, настроек и списка листов."""
-    _invalidate()
+    await _ensure_loaded()
+    return [
+        s for s in _store.students_list()
+        if not s.section and (class_num is None or s.class_num == class_num)
+    ]
